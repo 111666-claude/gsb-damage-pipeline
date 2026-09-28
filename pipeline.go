@@ -1,5 +1,6 @@
 // Package damagepipe 是战斗伤害结算管线：把一次攻击算成最终扣血并留一份战斗日志。
-// 缺陷：护甲用 max(0, armor) 夹住（负护甲不减伤）、结算顺序与策划表相反、每一步都向下取整。
+// 结算顺序按策划表：基础 + 固定加成 → 暴击 → 百分比增伤 → 固定减伤 → 百分比抗性 → 护甲，
+// 中间步骤一律浮点，只在最后向下取整；日志记录的就是真实扣血路径上的值。
 package damagepipe
 
 import (
@@ -15,6 +16,8 @@ var ErrSpec = errors.New("damagepipe: 结算参数不合法")
 type Attacker struct {
 	CritChance float64 // 0..1
 	CritDamage float64 // 1.5 表示 150%
+	FlatBonus  float64 // 固定加成，结算第一步加到基础伤害上
+	DamageAmp  float64 // 百分比增伤，0.2 表示 +20%
 }
 
 // Defender 是防守方参数。
@@ -28,42 +31,57 @@ type Defender struct {
 type Result struct {
 	Damage int
 	Log    []string
+	final  float64 // 取整前的真实扣血，供 Consistent 核对
 }
 
 // Compute 结算一次伤害。
-// 缺陷：实际扣血走「护甲（夹到 >= 0）→ 抗性 → 固定减伤 → 暴击」并在每步 floor；
-// 战斗日志却按策划口径的另一条路径算（暴击在前、不减夹护甲、只在最后取整），两条路会漂移。
+// 顺序固定为：基础 + 固定加成 → 暴击 → 百分比增伤 → 固定减伤 → 百分比抗性 → 护甲。
+// 护甲乘数 = 100/(100+armor)，armor 允许为负（破甲增伤），armor <= -100 报错。
+// 中间步骤用浮点，只在最后向下取整；日志只记录实际改变数值的步骤。
 func Compute(base float64, attacker Attacker, defender Defender, rng *rand.Rand) (Result, error) {
-	if base < 0 || defender.Resist < 0 || defender.Resist >= 1 {
+	if base < 0 || defender.Resist < 0 || defender.Resist >= 1 || defender.Armor <= -100 {
 		return Result{}, ErrSpec
 	}
 	crit := rng.Float64() < attacker.CritChance
 
-	// 实际扣血：缺陷路径
-	damage := base
-	armor := math.Max(0, defender.Armor) // 缺陷 1：负护甲被夹成 0
-	damage = math.Floor(damage * 100 / (100 + armor))
-	damage = math.Floor(damage * (1 - defender.Resist))
-	damage = math.Max(0, damage-defender.FlatReduce)
+	value := base + attacker.FlatBonus
+
+	// 日志与扣血共用同一条路径：定长数组记录步骤，不分配 map，切片只是数组的视图。
+	var steps [7]string
+	count := 0
+	steps[count] = format("base", value)
+	count++
 	if crit {
-		damage = math.Floor(damage * attacker.CritDamage) // 缺陷 2：暴击放在最后
+		value *= attacker.CritDamage
+		steps[count] = format("crit", value)
+		count++
+	}
+	if attacker.DamageAmp != 0 {
+		value *= 1 + attacker.DamageAmp
+		steps[count] = format("amp", value)
+		count++
+	}
+	if defender.FlatReduce != 0 {
+		value = math.Max(0, value-defender.FlatReduce) // 固定减伤在暴击之后，不会被暴击放大
+		steps[count] = format("flat", value)
+		count++
+	}
+	if defender.Resist != 0 {
+		value *= 1 - defender.Resist
+		steps[count] = format("resist", value)
+		count++
+	}
+	if defender.Armor != 0 {
+		value *= 100 / (100 + defender.Armor)
+		steps[count] = format("armor", value)
+		count++
 	}
 
-	// 战斗日志：策划口径的那条路径
-	log := []string{}
-	ideal := base
-	log = append(log, format("base", ideal))
-	if crit {
-		ideal *= attacker.CritDamage
-		log = append(log, format("crit", ideal))
+	damage := int(math.Floor(value)) // 只在最后取整
+	if damage < 0 {
+		damage = 0 // 伤害不得为负
 	}
-	ideal = math.Max(0, ideal-defender.FlatReduce)
-	log = append(log, format("flat", ideal))
-	ideal *= 1 - defender.Resist
-	log = append(log, format("resist", ideal))
-	ideal *= 100 / (100 + defender.Armor)
-	log = append(log, format("armor", ideal))
-	return Result{Damage: int(damage), Log: log}, nil
+	return Result{Damage: damage, Log: steps[:count], final: value}, nil
 }
 
 func format(step string, value float64) string {
@@ -74,10 +92,16 @@ func trim(value float64) string {
 	return strconvFloat(value)
 }
 
-// Consistent 是诊断接口：把日志最后一步（策划口径的值）与真实扣血比一比。
+// Consistent 是诊断接口：核对日志最后一步与真实扣血是否一致。
+// 日志按 3 位小数格式化，允许半个格式化单位以内的误差。
 func Consistent(result Result) bool {
 	if len(result.Log) == 0 {
 		return false
 	}
-	return math.Floor(parseLast(result.Log[len(result.Log)-1])) == float64(result.Damage)
+	last := parseLast(result.Log[len(result.Log)-1])
+	if last < 0 {
+		return false
+	}
+	return math.Abs(last-result.final) <= 0.0005 &&
+		math.Floor(result.final) == float64(result.Damage)
 }
